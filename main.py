@@ -8,197 +8,163 @@ app = FastAPI()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# =============================
-# In-memory storage (무료 플랜용)
-# =============================
-
+# 세션 저장
 user_sessions = {}
-user_limits = {}
 
+# 일일 사용 제한
+daily_usage = {}
 DAILY_LIMIT = 20
-RESET_SECONDS = 86400
 
 
-# =============================
-# 유틸
-# =============================
+@app.post(f"/webhook/{BOT_TOKEN}")
+async def telegram_webhook(request: Request):
+    data = await request.json()
 
-def check_rate_limit(user_id):
-    now = time.time()
+    # ===============================
+    # 📌 콜백 버튼 처리
+    # ===============================
+    if "callback_query" in data:
+        callback = data["callback_query"]
+        chat_id = callback["message"]["chat"]["id"]
+        user_id = callback["from"]["id"]
+        action = callback["data"]
 
-    if user_id not in user_limits:
-        user_limits[user_id] = {"count": 0, "reset": now + RESET_SECONDS}
+        if action == "summarize_now":
+            session = user_sessions.get(user_id)
 
-    data = user_limits[user_id]
+            if not session or not session.get("messages"):
+                send_message(chat_id, "요약할 메시지가 없습니다.")
+            else:
+                combined = "\n".join(session["messages"])
+                mode = session.get("mode", "standard")
+                result = summarize_text(combined, mode)
+                send_message(chat_id, result)
+                user_sessions[user_id] = {}
 
-    if now > data["reset"]:
-        data["count"] = 0
-        data["reset"] = now + RESET_SECONDS
+        if action == "clear_session":
+            user_sessions[user_id] = {}
+            send_message(chat_id, "세션 초기화 완료.")
 
-    if data["count"] >= DAILY_LIMIT:
-        return False
+        return {"ok": True}
 
-    data["count"] += 1
-    return True
+    # ===============================
+    # 📌 메시지 처리
+    # ===============================
+    if "message" in data:
+        message = data["message"]
+        chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+        text = message.get("text")
+
+        if not text:
+            return {"ok": True}
+
+        # 일일 제한 체크
+        today = time.strftime("%Y-%m-%d")
+        if user_id not in daily_usage:
+            daily_usage[user_id] = {"date": today, "count": 0}
+
+        if daily_usage[user_id]["date"] != today:
+            daily_usage[user_id] = {"date": today, "count": 0}
+
+        if daily_usage[user_id]["count"] >= DAILY_LIMIT:
+            send_message(chat_id, "오늘 사용량 초과 (20회)")
+            return {"ok": True}
+
+        # ===============================
+        # 명령어 처리
+        # ===============================
+        if text.startswith("/short"):
+            user_sessions[user_id] = {"mode": "short"}
+            send_message(chat_id, "3줄 요약 모드 설정")
+            return {"ok": True}
+
+        if text.startswith("/standard"):
+            user_sessions[user_id] = {"mode": "standard"}
+            send_message(chat_id, "5줄 요약 모드 설정")
+            return {"ok": True}
+
+        if text.startswith("/detailed"):
+            user_sessions[user_id] = {"mode": "detailed"}
+            send_message(chat_id, "8줄 요약 모드 설정")
+            return {"ok": True}
+
+        if text.startswith("/collect"):
+            user_sessions[user_id] = {
+                "collecting": True,
+                "messages": [],
+                "mode": "standard"
+            }
+
+            buttons = [
+                [{"text": "📄 지금 요약", "callback_data": "summarize_now"}],
+                [{"text": "🗑 초기화", "callback_data": "clear_session"}]
+            ]
+
+            send_message(chat_id, "수집 모드 시작. 메시지를 보내세요.", buttons)
+            return {"ok": True}
+
+        # ===============================
+        # 수집 모드 중일 때
+        # ===============================
+        session = user_sessions.get(user_id)
+
+        if session and session.get("collecting"):
+            session["messages"].append(text)
+            send_message(chat_id, "메시지 저장됨.")
+            return {"ok": True}
+
+        # ===============================
+        # 기본 자동 요약
+        # ===============================
+        mode = session.get("mode") if session else "standard"
+        summary = summarize_text(text, mode)
+        daily_usage[user_id]["count"] += 1
+        send_message(chat_id, summary)
+
+    return {"ok": True}
 
 
-def split_text(text, chunk_size=3000):
-    sentences = text.split(". ")
-    chunks = []
-    current = ""
+# ===============================
+# Gemini 요약 함수
+# ===============================
+def summarize_text(text, mode="standard"):
 
-    for s in sentences:
-        if len(current) + len(s) < chunk_size:
-            current += s + ". "
-        else:
-            chunks.append(current)
-            current = s + ". "
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
-def build_prompt(text, mode="standard"):
     if mode == "short":
-        bullet = 3
+        instruction = "Summarize in 3 concise lines."
     elif mode == "detailed":
-        bullet = 8
+        instruction = "Summarize in 8 detailed lines."
     else:
-        bullet = 5
+        instruction = "Summarize in 5 concise lines."
 
-    return f"""
-You are a professional summarization engine.
-
-Summarize the content below.
-
-Output format:
-- {bullet} concise bullet points
-- 1 core takeaway sentence
-- No opinions
-- No fluff
-- Preserve key facts
-
-Content:
-{text}
-"""
-
-
-def call_gemini(prompt):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
     payload = {
         "contents": [{
-            "parts": [{"text": prompt}]
+            "parts": [{"text": f"{instruction}\n{text}"}]
         }]
     }
 
-    try:
-        response = requests.post(url, json=payload, timeout=20)
-        result = response.json()
-        return result["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        return "요약 중 오류가 발생했습니다."
+    response = requests.post(url, json=payload)
+    result = response.json()
+
+    return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def summarize_text(text, mode="standard"):
-    if len(text) < 3000:
-        prompt = build_prompt(text, mode)
-        return call_gemini(prompt)
-
-    # 2-pass summarization
-    chunks = split_text(text)
-    partial_summaries = []
-
-    for chunk in chunks:
-        partial_summaries.append(call_gemini(build_prompt(chunk, "short")))
-
-    final_prompt = build_prompt("\n".join(partial_summaries), mode)
-    return call_gemini(final_prompt)
-
-
-def send_message(chat_id, text):
+# ===============================
+# 메시지 전송 함수
+# ===============================
+def send_message(chat_id, text, buttons=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    requests.post(url, json={
+    payload = {
         "chat_id": chat_id,
         "text": text
-    })
+    }
 
-
-# =============================
-# Webhook
-# =============================
-
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-
-    if "message" not in data:
-        return {"ok": True}
-
-    message = data["message"]
-    chat_id = message["chat"]["id"]
-    user_id = message["from"]["id"]
-    text = message.get("text", "")
-
-    if not check_rate_limit(user_id):
-        send_message(chat_id, "⚠ 하루 요약 한도 초과입니다.")
-        return {"ok": True}
-
-    # ===== 명령어 처리 =====
-
-    if text.startswith("/collect"):
-        user_sessions[user_id] = {
-            "collecting": True,
-            "messages": [],
-            "mode": "standard"
+    if buttons:
+        payload["reply_markup"] = {
+            "inline_keyboard": buttons
         }
-        send_message(chat_id, "📥 수집 모드 시작. 메시지를 보내세요.\n완료 시 /summarize")
-        return {"ok": True}
 
-    if text.startswith("/short"):
-        user_sessions.setdefault(user_id, {})["mode"] = "short"
-        send_message(chat_id, "📉 짧은 요약 모드 설정 완료")
-        return {"ok": True}
-
-    if text.startswith("/detailed"):
-        user_sessions.setdefault(user_id, {})["mode"] = "detailed"
-        send_message(chat_id, "📈 상세 요약 모드 설정 완료")
-        return {"ok": True}
-
-    if text.startswith("/standard"):
-        user_sessions.setdefault(user_id, {})["mode"] = "standard"
-        send_message(chat_id, "📊 표준 요약 모드 설정 완료")
-        return {"ok": True}
-
-    if text.startswith("/summarize"):
-        session = user_sessions.get(user_id)
-
-        if not session or not session.get("messages"):
-            send_message(chat_id, "수집된 메시지가 없습니다.")
-            return {"ok": True}
-
-        combined = "\n".join(session["messages"])
-        mode = session.get("mode", "standard")
-
-        result = summarize_text(combined, mode)
-        send_message(chat_id, result)
-
-        user_sessions[user_id] = {}
-        return {"ok": True}
-
-    # ===== 수집 모드일 경우 =====
-
-    if user_sessions.get(user_id, {}).get("collecting"):
-        user_sessions[user_id]["messages"].append(text)
-        return {"ok": True}
-
-    # ===== 기본 단일 메시지 요약 =====
-
-    mode = user_sessions.get(user_id, {}).get("mode", "standard")
-    result = summarize_text(text, mode)
-    send_message(chat_id, result)
-
-    return {"ok": True}
+    requests.post(url, json=payload)
