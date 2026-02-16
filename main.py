@@ -14,7 +14,7 @@ daily_usage = {}
 DAILY_LIMIT = 20
 
 
-@app.post(f"/webhook/{BOT_TOKEN}")
+@app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
 
