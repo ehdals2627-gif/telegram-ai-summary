@@ -2,16 +2,14 @@ from fastapi import FastAPI, Request
 import os
 import requests
 import time
+from bs4 import BeautifulSoup
 
 app = FastAPI()
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# 세션 저장
 user_sessions = {}
-
-# 일일 사용 제한
 daily_usage = {}
 DAILY_LIMIT = 20
 
@@ -21,7 +19,7 @@ async def telegram_webhook(request: Request):
     data = await request.json()
 
     # ===============================
-    # 📌 콜백 버튼 처리
+    # 버튼 처리
     # ===============================
     if "callback_query" in data:
         callback = data["callback_query"]
@@ -31,7 +29,6 @@ async def telegram_webhook(request: Request):
 
         if action == "summarize_now":
             session = user_sessions.get(user_id)
-
             if not session or not session.get("messages"):
                 send_message(chat_id, "요약할 메시지가 없습니다.")
             else:
@@ -48,7 +45,7 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     # ===============================
-    # 📌 메시지 처리
+    # 메시지 처리
     # ===============================
     if "message" in data:
         message = data["message"]
@@ -59,7 +56,7 @@ async def telegram_webhook(request: Request):
         if not text:
             return {"ok": True}
 
-        # 일일 제한 체크
+        # 사용 제한
         today = time.strftime("%Y-%m-%d")
         if user_id not in daily_usage:
             daily_usage[user_id] = {"date": today, "count": 0}
@@ -71,9 +68,7 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, "오늘 사용량 초과 (20회)")
             return {"ok": True}
 
-        # ===============================
-        # 명령어 처리
-        # ===============================
+        # 모드 설정
         if text.startswith("/short"):
             user_sessions[user_id] = {"mode": "short"}
             send_message(chat_id, "3줄 요약 모드 설정")
@@ -104,19 +99,29 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, "수집 모드 시작. 메시지를 보내세요.", buttons)
             return {"ok": True}
 
-        # ===============================
-        # 수집 모드 중일 때
-        # ===============================
+        # 수집 모드
         session = user_sessions.get(user_id)
-
         if session and session.get("collecting"):
             session["messages"].append(text)
             send_message(chat_id, "메시지 저장됨.")
             return {"ok": True}
 
         # ===============================
-        # 기본 자동 요약
+        # 🔥 링크 자동 감지
         # ===============================
+        if "http://" in text or "https://" in text:
+            article_text = extract_text_from_url(text)
+
+            if article_text:
+                summary = summarize_text(article_text)
+                daily_usage[user_id]["count"] += 1
+                send_message(chat_id, summary)
+            else:
+                send_message(chat_id, "링크 본문 추출 실패.")
+
+            return {"ok": True}
+
+        # 기본 자동 요약
         mode = session.get("mode") if session else "standard"
         summary = summarize_text(text, mode)
         daily_usage[user_id]["count"] += 1
@@ -126,7 +131,37 @@ async def telegram_webhook(request: Request):
 
 
 # ===============================
-# Gemini 요약 함수
+# 링크 본문 추출
+# ===============================
+def extract_text_from_url(url):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # script/style 제거
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+
+        text = soup.get_text(separator="\n")
+        lines = [line.strip() for line in text.splitlines()]
+        text = "\n".join(line for line in lines if len(line) > 50)
+
+        return text[:8000]  # 너무 길면 잘라냄
+
+    except:
+        return None
+
+
+# ===============================
+# Gemini 요약
 # ===============================
 def summarize_text(text, mode="standard"):
 
@@ -152,7 +187,7 @@ def summarize_text(text, mode="standard"):
 
 
 # ===============================
-# 메시지 전송 함수
+# Telegram 메시지 전송
 # ===============================
 def send_message(chat_id, text, buttons=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
